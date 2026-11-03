@@ -51,6 +51,12 @@ export function stepOnce() {
   useSim.getState().bump();
 }
 
+export function pauseSim() {
+  // let the in-flight move glide into its cell instead of freezing mid-cell
+  if (driver.alpha < 1) driver.stepping = true;
+  useSim.setState({ mode: "paused" });
+}
+
 export function resetSim() {
   engine = new Engine();
   driver.acc = 0;
@@ -82,7 +88,7 @@ export function startDriver() {
       driver.acc += dt * Math.max(speed, 1);
       driver.alpha = Math.min(1, driver.acc / TICK_INTERVAL);
       if (driver.alpha >= 1) driver.stepping = false;
-    } else {
+    } else if (mode === "stopped") {
       driver.alpha = 1;
     }
     requestAnimationFrame(loop);
