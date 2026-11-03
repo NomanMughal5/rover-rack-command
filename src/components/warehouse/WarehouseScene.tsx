@@ -4,22 +4,15 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { driver, getEngine, useEngine, useSim } from "@/sim/store";
-import type { Engine, Robot } from "@/sim/engine";
-import { RobotModel, STATUS_COLORS } from "./RobotModel";
+import type { Robot } from "@/sim/engine";
+import { RobotModel } from "./RobotModel";
+import { robotColor } from "./robotColor";
 import { useCamera } from "./camera";
 
 const W = 26;
 const H = 18;
 const wx = (x: number) => x - W / 2 + 0.5;
 const wz = (y: number) => y - H / 2 + 0.5;
-
-export function robotColor(engine: Engine, r: Robot) {
-  if (engine.isWaiting(r)) return STATUS_COLORS.waiting;
-  if (r.status === "loading" || r.status === "unloading") return STATUS_COLORS.loading;
-  if (r.packageId) return STATUS_COLORS.carrying;
-  if (r.moving) return STATUS_COLORS.moving;
-  return STATUS_COLORS.idle;
-}
 
 function useFloorTexture() {
   return useMemo(() => {
