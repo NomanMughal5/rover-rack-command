@@ -3,7 +3,7 @@ import { STATUS_COLORS } from "./robotColor";
 
 /** Industrial AMR: low chassis, dark lift deck, wheels, lidar, front LED bar. Faces +Z. */
 export function RobotModel({
-  statusColor = STATUS_COLORS.idle,
+  statusColor = STATUS_COLORS.idle as string,
   carrying = false,
   selected = false,
 }: {
@@ -39,7 +39,7 @@ export function RobotModel({
         [-0.3, -0.24],
         [0.3, -0.24],
       ].map(([x, z], i) => (
-        <mesh key={i} position={[x, 0.07, z]} rotation-z={Math.PI / 2}>
+        <mesh key={i} position={[x!, 0.07, z!]} rotation-z={Math.PI / 2}>
           <cylinderGeometry args={[0.07, 0.07, 0.06, 16]} />
           <meshStandardMaterial color="#1f2220" roughness={0.9} />
         </mesh>

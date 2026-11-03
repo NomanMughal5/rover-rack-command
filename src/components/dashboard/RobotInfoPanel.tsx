@@ -12,7 +12,7 @@ export function RobotDetails({ engine, r }: { engine: Engine; r: Robot }) {
   const pickup = task ? engine.loc(task.pickup) : null;
   const drop = task ? engine.loc(task.delivery) : null;
   const rows: [string, string][] = [
-    ["Model", r.model],
+    ["Model", r.model] as [string, string],
     ["Coordinates", `(${r.x}, ${r.y})`],
     ["Assigned task", task?.id ?? "—"],
     ["Package", r.packageId ?? "—"],

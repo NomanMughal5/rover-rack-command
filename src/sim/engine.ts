@@ -348,7 +348,7 @@ export class Engine {
     if (this.events.length > 200) this.events.length = 200;
   }
 
-  createTask(input?: { pickup?: string; delivery?: string; packageId?: string; priority?: Priority }) {
+  createTask(input?: { pickup?: string | undefined; delivery?: string | undefined; packageId?: string | undefined; priority?: Priority | undefined }) {
     const pickups = this.locations.filter((l) => l.kind === "pickup");
     const docks = this.locations.filter((l) => l.kind === "delivery");
     const pr: Priority[] = ["normal", "normal", "high", "low"];
