@@ -309,6 +309,7 @@ function FlowMarkers({ points }: { points: THREE.Vector3[] }) {
     if (!curve) return;
     for (let i = 0; i < points.length - 1; i++) curve.add(new THREE.LineCurve3(points[i], points[i + 1]));
   }, [curve, points]);
+  const cone = useMemo(() => new THREE.ConeGeometry(0.1, 0.24, 3).rotateX(Math.PI / 2), []);
   const count = Math.min(14, Math.max(2, Math.floor(points.length / 2)));
   useFrame(({ clock }) => {
     if (!curve || !group.current) return;
@@ -325,10 +326,8 @@ function FlowMarkers({ points }: { points: THREE.Vector3[] }) {
   return (
     <group ref={group}>
       {Array.from({ length: count }).map((_, i) => (
-        <mesh key={i}>
-          <coneGeometry args={[0.09, 0.22, 3]} />
+        <mesh key={i} geometry={cone}>
           <meshBasicMaterial color="#ef7a3c" />
-          <group rotation-x={Math.PI / 2} />
         </mesh>
       ))}
     </group>
