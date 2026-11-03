@@ -377,7 +377,7 @@ function Paths() {
   );
 }
 
-const HOME = new THREE.Vector3(0, 17, 17);
+const HOME = new THREE.Vector3(0, 22, 21);
 function CameraRig() {
   const { camera, controls } = useThree() as unknown as { camera: THREE.PerspectiveCamera; controls: OrbitControlsImpl | null };
   const { cmd, n } = useCamera();
