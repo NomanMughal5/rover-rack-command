@@ -74,7 +74,7 @@ export interface SimEvent {
   id: number;
   tick: number;
   type: EventType;
-  robotId?: string;
+  robotId?: string | undefined;
   message: string;
 }
 
