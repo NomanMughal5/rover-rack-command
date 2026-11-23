@@ -1,6 +1,6 @@
 // Pure TypeScript warehouse simulation. No React / three.js imports.
-// Mirrors the planned Java backend: grid graph, A* (binary-heap priority queue),
-// greedy task allocation, time-indexed reservation table and collision handling.
+// Real multi-agent Space-Time A* pathfinding, centralized spatio-temporal reservation table,
+// vertex and edge-swap conflict detection, prioritized greedy task allocation, and dynamic replanning.
 
 export type Cell = { x: number; y: number };
 export type RobotStatus =
@@ -117,6 +117,8 @@ function mulberry32(seed: number) {
 }
 
 export const key = (c: Cell) => `${c.x},${c.y}`;
+export const stKey = (x: number, y: number, t: number) => `${x},${y}@${t}`;
+export const edgeKey = (fx: number, fy: number, tx: number, ty: number, t: number) => `${fx},${fy}->${tx},${ty}@${t}`;
 export const manhattan = (a: Cell, b: Cell) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
 
 /** Min-heap priority queue (equivalent of java.util.PriorityQueue). */
@@ -159,7 +161,261 @@ export class MinHeap<T> {
   }
 }
 
-/** A* over a 4-connected grid. Returns the path excluding the start cell, or null. */
+// =========================================================================
+// Centralized Spatio-Temporal Reservation Ledger (MAPF Invariant Enforcement)
+// =========================================================================
+
+export class ReservationTable {
+  // (x, y, t) -> robotId
+  vertexMap = new Map<string, string>();
+  // (fx, fy -> tx, ty @ t) -> robotId
+  edgeMap = new Map<string, string>();
+  // robotId -> array of vertex keys
+  robotVertices = new Map<string, string[]>();
+  // robotId -> array of edge keys
+  robotEdges = new Map<string, string[]>();
+
+  isVertexReserved(x: number, y: number, t: number, ignoreRobotId?: string): boolean {
+    const owner = this.vertexMap.get(stKey(x, y, t));
+    return owner !== undefined && owner !== ignoreRobotId;
+  }
+
+  isEdgeReserved(fx: number, fy: number, tx: number, ty: number, t: number, ignoreRobotId?: string): boolean {
+    // Edge-swap conflict check: reverse edge traversal
+    const reverse = edgeKey(tx, ty, fx, fy, t);
+    const owner = this.edgeMap.get(reverse);
+    return owner !== undefined && owner !== ignoreRobotId;
+  }
+
+  commitRoute(robotId: string, route: Cell[], startTick: number, terminalStayTicks = 80) {
+    this.releaseRoute(robotId);
+
+    const vKeys: string[] = [];
+    const eKeys: string[] = [];
+
+    // 1. Reserve trajectory vertices and edges
+    for (let i = 0; i < route.length; i++) {
+      const step = route[i];
+      const t = startTick + i;
+      const vk = stKey(step.x, step.y, t);
+      this.vertexMap.set(vk, robotId);
+      vKeys.push(vk);
+
+      if (i > 0) {
+        const prev = route[i - 1];
+        const ek = edgeKey(prev.x, prev.y, step.x, step.y, t - 1);
+        this.edgeMap.set(ek, robotId);
+        eKeys.push(ek);
+      }
+    }
+
+    // 2. Reserve terminal stay buffer so parked robot blocks destination for future planners
+    if (route.length > 0 && terminalStayTicks > 0) {
+      const end = route[route.length - 1];
+      const endTick = startTick + route.length - 1;
+      for (let t = endTick + 1; t <= endTick + terminalStayTicks; t++) {
+        const vk = stKey(end.x, end.y, t);
+        this.vertexMap.set(vk, robotId);
+        vKeys.push(vk);
+      }
+    }
+
+    this.robotVertices.set(robotId, vKeys);
+    this.robotEdges.set(robotId, eKeys);
+  }
+
+  reserveStationaryStay(robotId: string, x: number, y: number, fromTick: number, durationTicks: number) {
+    let list = this.robotVertices.get(robotId);
+    if (!list) {
+      list = [];
+      this.robotVertices.set(robotId, list);
+    }
+    for (let t = fromTick; t <= fromTick + durationTicks; t++) {
+      const vk = stKey(x, y, t);
+      this.vertexMap.set(vk, robotId);
+      list.push(vk);
+    }
+  }
+
+  releaseRoute(robotId: string) {
+    const vKeys = this.robotVertices.get(robotId);
+    if (vKeys) {
+      for (const vk of vKeys) this.vertexMap.delete(vk);
+      this.robotVertices.delete(robotId);
+    }
+    const eKeys = this.robotEdges.get(robotId);
+    if (eKeys) {
+      for (const ek of eKeys) this.edgeMap.delete(ek);
+      this.robotEdges.delete(robotId);
+    }
+  }
+
+  purgeExpired(currentTick: number) {
+    for (const [vk] of this.vertexMap) {
+      const atIndex = vk.indexOf("@");
+      if (atIndex !== -1) {
+        const t = Number(vk.substring(atIndex + 1));
+        if (t < currentTick) this.vertexMap.delete(vk);
+      }
+    }
+    for (const [ek] of this.edgeMap) {
+      const atIndex = ek.indexOf("@");
+      if (atIndex !== -1) {
+        const t = Number(ek.substring(atIndex + 1));
+        if (t < currentTick) this.edgeMap.delete(ek);
+      }
+    }
+  }
+
+  getAllUpcoming(currentTick: number, maxHorizon = 12): Reservation[] {
+    const result: Reservation[] = [];
+    for (const [vk, robotId] of this.vertexMap) {
+      const atIndex = vk.indexOf("@");
+      if (atIndex !== -1) {
+        const t = Number(vk.substring(atIndex + 1));
+        if (t > currentTick && t <= currentTick + maxHorizon) {
+          const [coords] = vk.split("@");
+          const [x, y] = coords.split(",").map(Number);
+          result.push({ cell: { x, y }, t, robotId });
+        }
+      }
+    }
+    return result;
+  }
+}
+
+// =========================================================================
+// 3D Space-Time A* Multi-Agent Pathfinding Solver (x, y, t)
+// =========================================================================
+
+interface STNode {
+  x: number;
+  y: number;
+  t: number;
+  g: number;
+  h: number;
+  parent: STNode | null;
+}
+
+export function spaceTimeAStar(
+  W: number,
+  H: number,
+  blocked: boolean[][],
+  start: Cell,
+  goal: Cell,
+  startTime: number,
+  table: ReservationTable,
+  robotId: string,
+  maxHorizon = 120,
+): Cell[] | null {
+  if (start.x === goal.x && start.y === goal.y) return [{ x: start.x, y: start.y }];
+
+  const open = new MinHeap<STNode>();
+  const gScores = new Map<string, number>();
+  const closed = new Set<string>();
+
+  const startNode: STNode = {
+    x: start.x,
+    y: start.y,
+    t: startTime,
+    g: 0,
+    h: manhattan(start, goal),
+    parent: null,
+  };
+
+  const startK = stKey(start.x, start.y, startTime);
+  gScores.set(startK, 0);
+  open.push(startNode, startNode.h);
+
+  const maxTime = startTime + maxHorizon;
+  const dirs = [
+    [0, -1], // North
+    [0, 1],  // South
+    [1, 0],  // East
+    [-1, 0], // West
+  ];
+
+  while (open.size > 0) {
+    const cur = open.pop()!;
+    const curK = stKey(cur.x, cur.y, cur.t);
+
+    if (closed.has(curK)) continue;
+    closed.add(curK);
+
+    // Goal test
+    if (cur.x === goal.x && cur.y === goal.y) {
+      const path: Cell[] = [];
+      let n: STNode | null = cur;
+      while (n) {
+        path.push({ x: n.x, y: n.y });
+        n = n.parent;
+      }
+      return path.reverse();
+    }
+
+    if (cur.t >= maxTime) continue;
+
+    const nextT = cur.t + 1;
+    const tentativeG = cur.g + 1;
+
+    // 1. Evaluate Cardinal Neighbor Transitions (North, South, East, West)
+    for (const [dx, dy] of dirs) {
+      const nx = cur.x + dx;
+      const ny = cur.y + dy;
+
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      if (blocked[ny][nx]) continue;
+
+      // Vertex conflict
+      if (table.isVertexReserved(nx, ny, nextT, robotId)) continue;
+
+      // Edge-swap conflict
+      if (table.isEdgeReserved(cur.x, cur.y, nx, ny, cur.t, robotId)) continue;
+
+      const nextK = stKey(nx, ny, nextT);
+      if (closed.has(nextK)) continue;
+
+      const bestG = gScores.get(nextK) ?? Infinity;
+      if (tentativeG < bestG) {
+        gScores.set(nextK, tentativeG);
+        const nextNode: STNode = {
+          x: nx,
+          y: ny,
+          t: nextT,
+          g: tentativeG,
+          h: manhattan({ x: nx, y: ny }, goal),
+          parent: cur,
+        };
+        open.push(nextNode, tentativeG + nextNode.h);
+      }
+    }
+
+    // 2. Evaluate In-Place Wait Action: remain at (cur.x, cur.y) at nextT
+    if (!table.isVertexReserved(cur.x, cur.y, nextT, robotId)) {
+      const waitK = stKey(cur.x, cur.y, nextT);
+      if (!closed.has(waitK)) {
+        const bestG = gScores.get(waitK) ?? Infinity;
+        if (tentativeG < bestG) {
+          gScores.set(waitK, tentativeG);
+          const waitNode: STNode = {
+            x: cur.x,
+            y: cur.y,
+            t: nextT,
+            g: tentativeG,
+            h: manhattan({ x: cur.x, y: cur.y }, goal),
+            parent: cur,
+          };
+          open.push(waitNode, tentativeG + waitNode.h);
+        }
+      }
+    }
+  }
+
+  // Fallback if max horizon exceeded
+  return null;
+}
+
+/** Legacy 2D A* over 4-connected grid (maintained for backwards compatibility / fallback). */
 export function aStar(
   W: number,
   H: number,
@@ -215,8 +471,12 @@ export function aStar(
   return null;
 }
 
-const MODELS = ["Pallet Carrier P2", "Shelf Lifter S4", "Tote Runner T1", "Heavy Loader H8"];
-const NAMES = ["Atlas", "Bolt", "Cargo", "Dash", "Echo", "Flux", "Gizmo", "Hauler"];
+export const MODELS = ["Pallet Carrier P2", "Shelf Lifter S4", "Tote Runner T1", "Heavy Loader H8"];
+export const NAMES = ["Atlas", "Bolt", "Cargo", "Dash", "Echo", "Flux", "Gizmo", "Hauler"];
+
+// =========================================================================
+// Main Warehouse Simulation Engine Orchestrator
+// =========================================================================
 
 export class Engine {
   readonly W = 26;
@@ -237,6 +497,10 @@ export class Engine {
   blockedMoves = 0;
   swapConflicts = 0;
   autoGenerate = true;
+
+  // Real Multi-Agent Pathfinding Spatio-Temporal Reservation Ledger
+  public reservationTable = new ReservationTable();
+
   private taskSeq = 1;
   private pkgSeq = 1;
   private eventSeq = 1;
@@ -251,7 +515,7 @@ export class Engine {
     for (let i = 0; i < 6; i++) this.createTask();
     this.allocate();
     this.computeReservations();
-    this.log("system", "Simulation initialised — 8 AMRs online, 6 tasks queued");
+    this.log("system", "Simulation initialised — 8 AMRs online with Space-Time A* and Reservation Table");
   }
 
   private block(x: number, y: number, w: number, h: number) {
@@ -297,7 +561,7 @@ export class Engine {
   private spawnRobots() {
     for (let i = 0; i < 8; i++) {
       const home = { x: 2 + i * 3, y: 0 };
-      this.robots.push({
+      const robot: Robot = {
         id: `AMR-${String(i + 1).padStart(3, "0")}`,
         name: NAMES[i],
         model: MODELS[i % MODELS.length],
@@ -322,7 +586,10 @@ export class Engine {
         dwell: 0,
         busyTicks: 0,
         blockedBy: null,
-      });
+      };
+      this.robots.push(robot);
+      // Book initial stationary reservation for parked robot
+      this.reservationTable.reserveStationaryStay(robot.id, home.x, home.y, 0, 100);
     }
   }
 
@@ -366,45 +633,79 @@ export class Engine {
     this.taskSeq++;
     if (!input?.packageId) this.pkgSeq++;
     this.tasks.unshift(t);
-    this.log("task", `${t.id} created: ${t.pickup} → ${t.delivery} (${t.packageId})`);
+    this.log("task", `${t.id} created [${t.priority.toUpperCase()}]: ${t.pickup} → ${t.delivery} (${t.packageId})`);
     return t;
   }
 
-  private obstaclesFor(r: Robot) {
-    const s = new Set<string>();
-    for (const o of this.robots) if (o !== r && !o.moving) s.add(key(o));
-    return s;
+  /**
+   * Plans a conflict-free Space-Time A* path using the centralized ReservationTable.
+   */
+  plan(r: Robot, goal: Cell) {
+    // 1. Release previous reservations so they do not self-block
+    this.reservationTable.releaseRoute(r.id);
+
+    // 2. Plan in 3D Space-Time
+    let stPath = spaceTimeAStar(
+      this.W,
+      this.H,
+      this.blocked,
+      { x: r.x, y: r.y },
+      goal,
+      this.tick,
+      this.reservationTable,
+      r.id,
+      120,
+    );
+
+    // Fallback to 2D A* if horizon or extreme congestion prevents search
+    if (!stPath || stPath.length <= 1) {
+      const fallback2D = aStar(this.W, this.H, this.blocked, { x: r.x, y: r.y }, goal);
+      if (fallback2D && fallback2D.length > 0) {
+        stPath = [{ x: r.x, y: r.y }, ...fallback2D];
+      }
+    }
+
+    if (stPath && stPath.length > 0) {
+      // Commit into reservation table
+      this.reservationTable.commitRoute(r.id, stPath, this.tick, 80);
+      r.route = [...stPath];
+      // Path excludes the starting cell
+      r.path = stPath.slice(1);
+      r.goal = goal;
+    } else {
+      r.path = [];
+      r.route = [{ x: r.x, y: r.y }];
+      r.goal = goal;
+      this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 10);
+    }
   }
 
-  private plan(r: Robot, goal: Cell, avoid?: Set<string>) {
-    const extra = avoid ?? this.obstaclesFor(r);
-    let p = aStar(this.W, this.H, this.blocked, r, goal, extra);
-    if (!p) p = aStar(this.W, this.H, this.blocked, r, goal);
-    r.path = p ?? [];
-    r.route = [{ x: r.x, y: r.y }, ...r.path];
-    r.goal = goal;
-  }
-
-  /** Greedy allocation: highest priority / oldest task gets the nearest available robot. */
+  /**
+   * Greedy Task Allocation: Priority-Ranked Queue + Manhattan Distance Evaluation.
+   */
   allocate() {
     const pending = this.tasks
       .filter((t) => t.status === "pending")
       .sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || a.createdTick - b.createdTick);
+
     let assigned = 0;
     for (const t of pending) {
       const free = this.robots.filter(
         (r) => (r.status === "idle" || r.status === "returning") && !r.taskId && r.battery > 18,
       );
       if (!free.length) break;
+
       const pc = this.loc(t.pickup).cell;
       free.sort((a, b) => manhattan(a, pc) - manhattan(b, pc));
       const r = free[0];
+
       t.status = "assigned";
       t.robotId = r.id;
       r.taskId = t.id;
       r.status = "to_pickup";
       r.moving = true;
       r.waitTicks = 0;
+
       this.plan(r, pc);
       this.log("assign", `${r.id} assigned ${t.id} (${manhattan(r, pc)} cells to ${t.pickup})`, r.id);
       assigned++;
@@ -412,8 +713,13 @@ export class Engine {
     return assigned;
   }
 
+  /**
+   * Advances the simulation clock by 1 discrete tick.
+   */
   step() {
     this.tick++;
+
+    // Periodic auto-generation
     if (this.autoGenerate && this.tick % 7 === 0) {
       const open = this.tasks.filter((t) => t.status === "pending").length;
       if (open < 4) this.createTask();
@@ -426,24 +732,30 @@ export class Engine {
       r.blockedBy = null;
     }
 
-    // dwell handling
+    // 1. Dwell handling (loading at pickup / unloading at delivery)
     for (const r of this.robots) {
       if (r.status === "loading" || r.status === "unloading") {
         r.dwell--;
+        // Re-book stationary stay while dwelling
+        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
+
         if (r.dwell > 0) continue;
-        const t = this.task(r.taskId)!;
+
+        const t = this.task(r.taskId);
+        if (!t) continue;
+
         if (r.status === "loading") {
           r.packageId = t.packageId;
           t.status = "in_progress";
           r.status = "to_delivery";
           r.moving = true;
-          this.log("pickup", `${r.id} picked up ${t.packageId} at ${t.pickup}`, r.id);
+          this.log("pickup", `${r.id} loaded ${t.packageId} at ${t.pickup}`, r.id);
           this.plan(r, this.loc(t.delivery).cell);
         } else {
           t.status = "completed";
           t.completedTick = this.tick;
           r.completed++;
-          this.log("deliver", `${r.id} completed delivery of ${r.packageId} at ${t.delivery}`, r.id);
+          this.log("deliver", `${r.id} delivered ${r.packageId} to ${t.delivery}`, r.id);
           r.packageId = null;
           r.taskId = null;
           r.status = "returning";
@@ -453,116 +765,102 @@ export class Engine {
       }
     }
 
-    // movement resolution with collision handling
-    const movers = this.robots
-      .filter((r) => r.moving && r.path.length)
-      .sort((a, b) => Number(!!b.packageId) - Number(!!a.packageId) || a.id.localeCompare(b.id));
-    const claimed = new Map<string, string>();
-    const at = new Map<string, Robot>();
-    for (const r of this.robots) at.set(key(r), r);
-    for (const r of this.robots) if (!movers.includes(r)) claimed.set(key(r), r.id);
-
-    const decided = new Map<Robot, boolean>(); // true = move
-    let progress = true;
-    while (progress) {
-      progress = false;
-      for (const r of movers) {
-        if (decided.has(r)) continue;
-        const next = r.path[0];
-        const nk = key(next);
-        if (claimed.has(nk)) {
-          decided.set(r, false);
-          claimed.set(key(r), r.id);
-          r.blockedBy = claimed.get(nk)!;
-          progress = true;
-          continue;
-        }
-        const occ = at.get(nk);
-        if (occ && occ !== r && !decided.has(occ)) {
-          const on = occ.path[0];
-          if (on && on.x === r.x && on.y === r.y) {
-            // opposite-direction swap conflict: lower-priority robot yields and replans
-            this.swapConflicts++;
-            const yielder = movers.indexOf(r) > movers.indexOf(occ) ? r : occ;
-            const other = yielder === r ? occ : r;
-            this.addConflict("swap", [r.id, occ.id], next);
-            const avoid = this.obstaclesFor(yielder);
-            avoid.add(key(other));
-            this.plan(yielder, yielder.goal!, avoid);
-            this.replans++;
-            this.log("replan", `${yielder.id} replanned around ${other.id} (opposite-direction conflict)`, yielder.id);
-            decided.set(yielder, false);
-            claimed.set(key(yielder), yielder.id);
-            yielder.blockedBy = other.id;
-            progress = true;
-          }
-          continue; // wait for occupant to decide
-        }
-        decided.set(r, true);
-        claimed.set(nk, r.id);
-        progress = true;
-      }
-    }
+    // 2. Physical kinematics execution with Space-Time safety guard
+    const movers = this.robots.filter((r) => r.moving && r.path.length > 0);
 
     for (const r of movers) {
-      const move = decided.get(r) === true;
-      if (!move) {
-        if (!decided.has(r)) claimed.set(key(r), r.id);
+      const next = r.path[0];
+
+      // Physical guard check: is another robot currently physically standing at 'next'?
+      let blocker: Robot | null = null;
+      for (const other of this.robots) {
+        if (other.id !== r.id && other.x === next.x && other.y === next.y) {
+          blocker = other;
+          break;
+        }
+      }
+
+      if (blocker) {
+        // Physical collision prevention: pause and trigger dynamic replan
         r.waitTicks++;
         r.totalWait++;
         this.blockedMoves++;
-        if (r.waitTicks === 1) {
-          const by = r.blockedBy ? ` (cell held by ${r.blockedBy})` : "";
-          this.addConflict("vertex", [r.id, r.blockedBy ?? "?"], r.path[0]);
-          this.log("wait", `${r.id} waiting for cell (${r.path[0].x},${r.path[0].y})${by}`, r.id);
+        r.blockedBy = blocker.id;
+
+        // Detect if head-on opposite direction swap
+        const isSwap = blocker.moving && blocker.path.length > 0 && blocker.path[0].x === r.x && blocker.path[0].y === r.y;
+        if (isSwap) {
+          this.swapConflicts++;
+          this.addConflict("swap", [r.id, blocker.id], next);
+        } else {
+          this.addConflict("vertex", [r.id, blocker.id], next);
         }
-        if (r.waitTicks >= 3 && r.goal) {
-          const avoid = this.obstaclesFor(r);
-          avoid.add(key(r.path[0]));
-          this.plan(r, r.goal, avoid);
+
+        this.log("wait", `${r.id} yielded cell (${next.x},${next.y}) held by ${blocker.id}`, r.id);
+
+        // Dynamic Space-Time Replan
+        if (r.goal) {
+          this.plan(r, r.goal);
           this.replans++;
-          r.waitTicks = 0;
-          this.log("replan", `${r.id} recomputed A* route (${r.path.length} cells)`, r.id);
+          this.log("replan", `${r.id} dynamically recomputed space-time route (${r.path.length} cells)`, r.id);
         }
         continue;
       }
-      const next = r.path.shift()!;
-      r.heading = Math.atan2(next.x - r.x, next.y - r.y);
-      r.x = next.x;
-      r.y = next.y;
+
+      // Step along scheduled route
+      const nextStep = r.path.shift()!;
+      r.heading = Math.atan2(nextStep.x - r.x, nextStep.y - r.y);
+      r.x = nextStep.x;
+      r.y = nextStep.y;
       r.distance++;
       r.battery = Math.max(5, r.battery - (r.packageId ? 0.18 : 0.1));
       r.busyTicks++;
+
       if (r.waitTicks > 0) this.resolveConflictsFor(r.id);
       r.waitTicks = 0;
     }
 
-    // arrivals
+    // 3. Arrivals & Mission transitions
     for (const r of this.robots) {
-      if (!r.moving || r.path.length) continue;
+      if (!r.moving || r.path.length > 0) continue;
+
       if (r.status === "to_pickup") {
         r.status = "loading";
         r.moving = false;
         r.dwell = 2;
+        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
       } else if (r.status === "to_delivery") {
         r.status = "unloading";
         r.moving = false;
         r.dwell = 2;
+        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
       } else if (r.status === "returning") {
         if (r.x === r.home.x && r.y === r.home.y) {
           r.status = "idle";
           r.moving = false;
           r.route = [];
           r.goal = null;
-        } else this.plan(r, r.home);
+          this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 80);
+        } else {
+          this.plan(r, r.home);
+        }
       }
     }
+
+    // 4. Idle maintenance & recharge
     for (const r of this.robots) {
-      if (r.status === "idle") r.battery = Math.min(100, r.battery + 0.6);
-      if (r.moving && r.waitTicks > 0) r.status = r.status; // status retained; waiting shown via waitTicks
+      if (r.status === "idle") {
+        r.battery = Math.min(100, r.battery + 0.6);
+        // Rolling reservation for idle parking bay
+        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 80);
+      }
     }
 
+    // 5. Purge expired reservations and sync UI reservations array
+    this.reservationTable.purgeExpired(this.tick);
     this.computeReservations();
+
+    // 6. Record history time-series data
     const done = this.tasks.filter((t) => t.status === "completed").length;
     this.history.push({
       tick: this.tick,
@@ -583,14 +881,9 @@ export class Engine {
     for (const c of this.conflicts) if (!c.resolved && c.robots[0] === id) c.resolved = true;
   }
 
-  /** Time-based reservation table: each moving robot reserves its next cells for t+1..t+5. */
+  /** Syncs upcoming reservations from the Space-Time Reservation Table for UI rendering. */
   computeReservations() {
-    const res: Reservation[] = [];
-    for (const r of this.robots) {
-      res.push({ cell: { x: r.x, y: r.y }, t: this.tick, robotId: r.id });
-      r.path.slice(0, 5).forEach((c, i) => res.push({ cell: c, t: this.tick + i + 1, robotId: r.id }));
-    }
-    this.reservations = res;
+    this.reservations = this.reservationTable.getAllUpcoming(this.tick, 8);
   }
 
   isWaiting(r: Robot) {
