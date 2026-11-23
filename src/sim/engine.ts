@@ -40,10 +40,10 @@ export interface Robot {
   py: number;
   heading: number;
   status: RobotStatus;
-  moving: boolean; // true when status is a travelling state
+  moving: boolean;
   battery: number;
   path: Cell[];
-  route: Cell[]; // full planned route of current leg (for display)
+  route: Cell[];
   goal: Cell | null;
   home: Cell;
   taskId: string | null;
@@ -52,6 +52,7 @@ export interface Robot {
   completed: number;
   waitTicks: number;
   totalWait: number;
+  stuckTicks: number; // consecutive ticks with empty path while moving
   dwell: number;
   busyTicks: number;
   blockedBy: string | null;
@@ -100,10 +101,17 @@ export interface HistoryPoint {
   waiting: number;
 }
 
-export const TICK_SECONDS = 4; // simulated seconds per tick (for clock display)
+export const TICK_SECONDS = 4;
 export const SIM_START = Date.UTC(2026, 10, 3, 8, 0, 0);
 
 const PRIORITY_RANK: Record<Priority, number> = { high: 0, normal: 1, low: 2 };
+
+// Max ticks to stay stuck before forcing replan/abort
+const MAX_STUCK_TICKS = 6;
+// Terminal stay at a destination (ticks). Keep small so we don't lock the grid.
+const TERMINAL_BUFFER = 20;
+// Idle robots reserve only a short rolling window so moving robots can path around them.
+const IDLE_RESERVE_WINDOW = 15;
 
 function mulberry32(seed: number) {
   let a = seed >>> 0;
@@ -187,13 +195,12 @@ export class ReservationTable {
     return owner !== undefined && owner !== ignoreRobotId;
   }
 
-  commitRoute(robotId: string, route: Cell[], startTick: number, terminalStayTicks = 80) {
+  commitRoute(robotId: string, route: Cell[], startTick: number, terminalStayTicks = TERMINAL_BUFFER) {
     this.releaseRoute(robotId);
 
     const vKeys: string[] = [];
     const eKeys: string[] = [];
 
-    // 1. Reserve trajectory vertices and edges
     for (let i = 0; i < route.length; i++) {
       const step = route[i];
       const t = startTick + i;
@@ -209,7 +216,7 @@ export class ReservationTable {
       }
     }
 
-    // 2. Reserve terminal stay buffer so parked robot blocks destination for future planners
+    // Terminal stay buffer — short so it doesn't permanently block corridors
     if (route.length > 0 && terminalStayTicks > 0) {
       const end = route[route.length - 1];
       const endTick = startTick + route.length - 1;
@@ -225,6 +232,8 @@ export class ReservationTable {
   }
 
   reserveStationaryStay(robotId: string, x: number, y: number, fromTick: number, durationTicks: number) {
+    // Only add incremental ticks — don't wipe the whole route reservation.
+    // This avoids overwriting per-route bookings with stationary stay registrations.
     let list = this.robotVertices.get(robotId);
     if (!list) {
       list = [];
@@ -232,20 +241,26 @@ export class ReservationTable {
     }
     for (let t = fromTick; t <= fromTick + durationTicks; t++) {
       const vk = stKey(x, y, t);
-      this.vertexMap.set(vk, robotId);
-      list.push(vk);
+      if (!this.vertexMap.has(vk)) {
+        this.vertexMap.set(vk, robotId);
+        list.push(vk);
+      }
     }
   }
 
   releaseRoute(robotId: string) {
     const vKeys = this.robotVertices.get(robotId);
     if (vKeys) {
-      for (const vk of vKeys) this.vertexMap.delete(vk);
+      for (const vk of vKeys) {
+        if (this.vertexMap.get(vk) === robotId) this.vertexMap.delete(vk);
+      }
       this.robotVertices.delete(robotId);
     }
     const eKeys = this.robotEdges.get(robotId);
     if (eKeys) {
-      for (const ek of eKeys) this.edgeMap.delete(ek);
+      for (const ek of eKeys) {
+        if (this.edgeMap.get(ek) === robotId) this.edgeMap.delete(ek);
+      }
       this.robotEdges.delete(robotId);
     }
   }
@@ -306,7 +321,7 @@ export function spaceTimeAStar(
   startTime: number,
   table: ReservationTable,
   robotId: string,
-  maxHorizon = 120,
+  maxHorizon = 150,
 ): Cell[] | null {
   if (start.x === goal.x && start.y === goal.y) return [{ x: start.x, y: start.y }];
 
@@ -342,7 +357,6 @@ export function spaceTimeAStar(
     if (closed.has(curK)) continue;
     closed.add(curK);
 
-    // Goal test
     if (cur.x === goal.x && cur.y === goal.y) {
       const path: Cell[] = [];
       let n: STNode | null = cur;
@@ -358,7 +372,7 @@ export function spaceTimeAStar(
     const nextT = cur.t + 1;
     const tentativeG = cur.g + 1;
 
-    // 1. Evaluate Cardinal Neighbor Transitions (North, South, East, West)
+    // 1. Cardinal neighbor transitions
     for (const [dx, dy] of dirs) {
       const nx = cur.x + dx;
       const ny = cur.y + dy;
@@ -366,10 +380,7 @@ export function spaceTimeAStar(
       if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
       if (blocked[ny][nx]) continue;
 
-      // Vertex conflict
       if (table.isVertexReserved(nx, ny, nextT, robotId)) continue;
-
-      // Edge-swap conflict
       if (table.isEdgeReserved(cur.x, cur.y, nx, ny, cur.t, robotId)) continue;
 
       const nextK = stKey(nx, ny, nextT);
@@ -390,7 +401,7 @@ export function spaceTimeAStar(
       }
     }
 
-    // 2. Evaluate In-Place Wait Action: remain at (cur.x, cur.y) at nextT
+    // 2. In-place wait action
     if (!table.isVertexReserved(cur.x, cur.y, nextT, robotId)) {
       const waitK = stKey(cur.x, cur.y, nextT);
       if (!closed.has(waitK)) {
@@ -411,11 +422,10 @@ export function spaceTimeAStar(
     }
   }
 
-  // Fallback if max horizon exceeded
   return null;
 }
 
-/** Legacy 2D A* over 4-connected grid (maintained for backwards compatibility / fallback). */
+/** Legacy 2D A* over 4-connected grid (fallback when Space-Time horizon exhausted). */
 export function aStar(
   W: number,
   H: number,
@@ -498,7 +508,6 @@ export class Engine {
   swapConflicts = 0;
   autoGenerate = true;
 
-  // Real Multi-Agent Pathfinding Spatio-Temporal Reservation Ledger
   public reservationTable = new ReservationTable();
 
   private taskSeq = 1;
@@ -540,15 +549,12 @@ export class Engine {
         n++;
       });
     });
-    // loading dock wall + trucks
     this.block(0, 17, this.W, 1);
     [3, 8, 15, 20].forEach((x, i) => {
       this.locations.push({ id: `D${i + 1}`, label: `Dock ${i + 1}`, kind: "delivery", cell: { x: x + 1, y: 16 } });
     });
-    // restricted maintenance zone
     this.restricted.push({ x: 11, y: 14, w: 3, h: 2 });
     this.block(11, 14, 3, 2);
-    // pallet obstacles
     this.obstacles = [
       { x: 0, y: 9 },
       { x: 25, y: 5 },
@@ -559,8 +565,9 @@ export class Engine {
   }
 
   private spawnRobots() {
+    // Spread robots across the top row with more spacing to reduce startup congestion
     for (let i = 0; i < 8; i++) {
-      const home = { x: 2 + i * 3, y: 0 };
+      const home = { x: 1 + i * 3, y: 1 };  // y=1 avoids blocked y=0 edge-cases; spacing=3
       const robot: Robot = {
         id: `AMR-${String(i + 1).padStart(3, "0")}`,
         name: NAMES[i],
@@ -583,13 +590,14 @@ export class Engine {
         completed: 0,
         waitTicks: 0,
         totalWait: 0,
+        stuckTicks: 0,
         dwell: 0,
         busyTicks: 0,
         blockedBy: null,
       };
       this.robots.push(robot);
-      // Book initial stationary reservation for parked robot
-      this.reservationTable.reserveStationaryStay(robot.id, home.x, home.y, 0, 100);
+      // Short rolling reservation — avoids permanently locking corridors
+      this.reservationTable.reserveStationaryStay(robot.id, home.x, home.y, 0, IDLE_RESERVE_WINDOW);
     }
   }
 
@@ -638,13 +646,13 @@ export class Engine {
   }
 
   /**
-   * Plans a conflict-free Space-Time A* path using the centralized ReservationTable.
+   * Plans a conflict-free Space-Time A* path, with 2D A* fallback.
+   * Returns true if a path was found.
    */
-  plan(r: Robot, goal: Cell) {
-    // 1. Release previous reservations so they do not self-block
+  plan(r: Robot, goal: Cell): boolean {
+    // Release previous reservations so they don't self-block
     this.reservationTable.releaseRoute(r.id);
 
-    // 2. Plan in 3D Space-Time
     let stPath = spaceTimeAStar(
       this.W,
       this.H,
@@ -654,10 +662,10 @@ export class Engine {
       this.tick,
       this.reservationTable,
       r.id,
-      120,
+      150,
     );
 
-    // Fallback to 2D A* if horizon or extreme congestion prevents search
+    // Fallback to 2D A* if space-time horizon exhausted
     if (!stPath || stPath.length <= 1) {
       const fallback2D = aStar(this.W, this.H, this.blocked, { x: r.x, y: r.y }, goal);
       if (fallback2D && fallback2D.length > 0) {
@@ -666,17 +674,19 @@ export class Engine {
     }
 
     if (stPath && stPath.length > 0) {
-      // Commit into reservation table
-      this.reservationTable.commitRoute(r.id, stPath, this.tick, 80);
+      this.reservationTable.commitRoute(r.id, stPath, this.tick, TERMINAL_BUFFER);
       r.route = [...stPath];
-      // Path excludes the starting cell
       r.path = stPath.slice(1);
       r.goal = goal;
+      r.stuckTicks = 0;
+      return true;
     } else {
+      // No path found — hold position briefly
       r.path = [];
       r.route = [{ x: r.x, y: r.y }];
       r.goal = goal;
-      this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 10);
+      this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 3);
+      return false;
     }
   }
 
@@ -705,6 +715,7 @@ export class Engine {
       r.status = "to_pickup";
       r.moving = true;
       r.waitTicks = 0;
+      r.stuckTicks = 0;
 
       this.plan(r, pc);
       this.log("assign", `${r.id} assigned ${t.id} (${manhattan(r, pc)} cells to ${t.pickup})`, r.id);
@@ -732,11 +743,10 @@ export class Engine {
       r.blockedBy = null;
     }
 
-    // 1. Dwell handling (loading at pickup / unloading at delivery)
+    // ── Phase 1: Dwell handling (loading at pickup / unloading at delivery) ──
     for (const r of this.robots) {
       if (r.status === "loading" || r.status === "unloading") {
         r.dwell--;
-        // Re-book stationary stay while dwelling
         this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
 
         if (r.dwell > 0) continue;
@@ -749,6 +759,7 @@ export class Engine {
           t.status = "in_progress";
           r.status = "to_delivery";
           r.moving = true;
+          r.stuckTicks = 0;
           this.log("pickup", `${r.id} loaded ${t.packageId} at ${t.pickup}`, r.id);
           this.plan(r, this.loc(t.delivery).cell);
         } else {
@@ -760,18 +771,19 @@ export class Engine {
           r.taskId = null;
           r.status = "returning";
           r.moving = true;
+          r.stuckTicks = 0;
           this.plan(r, r.home);
         }
       }
     }
 
-    // 2. Physical kinematics execution with Space-Time safety guard
+    // ── Phase 2: Physical kinematics with Space-Time safety guard ──
     const movers = this.robots.filter((r) => r.moving && r.path.length > 0);
 
     for (const r of movers) {
       const next = r.path[0];
 
-      // Physical guard check: is another robot currently physically standing at 'next'?
+      // Physical guard: is another robot physically standing at next?
       let blocker: Robot | null = null;
       for (const other of this.robots) {
         if (other.id !== r.id && other.x === next.x && other.y === next.y) {
@@ -781,14 +793,18 @@ export class Engine {
       }
 
       if (blocker) {
-        // Physical collision prevention: pause and trigger dynamic replan
         r.waitTicks++;
         r.totalWait++;
+        r.stuckTicks++;
         this.blockedMoves++;
         r.blockedBy = blocker.id;
 
-        // Detect if head-on opposite direction swap
-        const isSwap = blocker.moving && blocker.path.length > 0 && blocker.path[0].x === r.x && blocker.path[0].y === r.y;
+        const isSwap =
+          blocker.moving &&
+          blocker.path.length > 0 &&
+          blocker.path[0].x === r.x &&
+          blocker.path[0].y === r.y;
+
         if (isSwap) {
           this.swapConflicts++;
           this.addConflict("swap", [r.id, blocker.id], next);
@@ -798,16 +814,18 @@ export class Engine {
 
         this.log("wait", `${r.id} yielded cell (${next.x},${next.y}) held by ${blocker.id}`, r.id);
 
-        // Dynamic Space-Time Replan
+        // Dynamic replan
         if (r.goal) {
-          this.plan(r, r.goal);
+          const ok = this.plan(r, r.goal);
           this.replans++;
-          this.log("replan", `${r.id} dynamically recomputed space-time route (${r.path.length} cells)`, r.id);
+          if (ok) {
+            this.log("replan", `${r.id} recomputed space-time route (${r.path.length} cells)`, r.id);
+          }
         }
         continue;
       }
 
-      // Step along scheduled route
+      // Execute step
       const nextStep = r.path.shift()!;
       r.heading = Math.atan2(nextStep.x - r.x, nextStep.y - r.y);
       r.x = nextStep.x;
@@ -815,52 +833,84 @@ export class Engine {
       r.distance++;
       r.battery = Math.max(5, r.battery - (r.packageId ? 0.18 : 0.1));
       r.busyTicks++;
+      r.stuckTicks = 0;
 
       if (r.waitTicks > 0) this.resolveConflictsFor(r.id);
       r.waitTicks = 0;
     }
 
-    // 3. Arrivals & Mission transitions
+    // ── Phase 3: Handle robots that are moving but have empty path ──
+    // (Either arrived at goal, or stuck with no path found)
     for (const r of this.robots) {
-      if (!r.moving || r.path.length > 0) continue;
+      if (!r.moving) continue;
 
-      if (r.status === "to_pickup") {
-        r.status = "loading";
-        r.moving = false;
-        r.dwell = 2;
-        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
-      } else if (r.status === "to_delivery") {
-        r.status = "unloading";
-        r.moving = false;
-        r.dwell = 2;
-        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
-      } else if (r.status === "returning") {
-        if (r.x === r.home.x && r.y === r.home.y) {
-          r.status = "idle";
-          r.moving = false;
-          r.route = [];
-          r.goal = null;
-          this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 80);
-        } else {
-          this.plan(r, r.home);
+      if (r.path.length === 0) {
+        // Check if we're at goal
+        if (r.goal && r.x === r.goal.x && r.y === r.goal.y) {
+          // Arrived!
+          if (r.status === "to_pickup") {
+            r.status = "loading";
+            r.moving = false;
+            r.dwell = 2;
+            r.stuckTicks = 0;
+            this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
+          } else if (r.status === "to_delivery") {
+            r.status = "unloading";
+            r.moving = false;
+            r.dwell = 2;
+            r.stuckTicks = 0;
+            this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 4);
+          } else if (r.status === "returning") {
+            r.status = "idle";
+            r.moving = false;
+            r.route = [];
+            r.goal = null;
+            r.stuckTicks = 0;
+            // Short rolling idle reservation
+            this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, IDLE_RESERVE_WINDOW);
+          }
+        } else if (r.goal) {
+          // Not at goal but path is empty — stuck or no path found
+          r.stuckTicks++;
+
+          if (r.stuckTicks >= MAX_STUCK_TICKS) {
+            // Force replan
+            const ok = this.plan(r, r.goal);
+            this.replans++;
+            if (ok) {
+              this.log("replan", `${r.id} force-replan after ${r.stuckTicks} stuck ticks`, r.id);
+              r.stuckTicks = 0;
+            } else if (r.stuckTicks > MAX_STUCK_TICKS * 3) {
+              // Complete deadlock — abort task and return home
+              this._abortRobotTask(r);
+            }
+          }
         }
       }
     }
 
-    // 4. Idle maintenance & recharge
+    // ── Phase 4: Arrival check for robots that just moved into goal ──
+    // (handle edge case where path was [one step] and was consumed above)
     for (const r of this.robots) {
-      if (r.status === "idle") {
-        r.battery = Math.min(100, r.battery + 0.6);
-        // Rolling reservation for idle parking bay
-        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, 80);
+      if (r.moving && r.path.length === 0 && !r.goal) {
+        r.moving = false;
       }
     }
 
-    // 5. Purge expired reservations and sync UI reservations array
+    // ── Phase 5: Idle recharge + rolling reservation refresh ──
+    for (const r of this.robots) {
+      if (r.status === "idle") {
+        r.battery = Math.min(100, r.battery + 0.6);
+        // Rolling short window — prevents permanently blocking corridors
+        this.reservationTable.reserveStationaryStay(r.id, r.x, r.y, this.tick, IDLE_RESERVE_WINDOW);
+      }
+    }
+
+    // ── Phase 6: Purge expired reservations, sync UI reservations array ──
     this.reservationTable.purgeExpired(this.tick);
     this.computeReservations();
 
-    // 6. Record history time-series data
+    // ── Phase 7: History ──
     const done = this.tasks.filter((t) => t.status === "completed").length;
     this.history.push({
       tick: this.tick,
@@ -869,6 +919,23 @@ export class Engine {
       waiting: this.robots.filter((r) => r.waitTicks > 0).length,
     });
     if (this.history.length > 240) this.history.shift();
+  }
+
+  /** Aborts the current task for a deadlocked robot and replans a return home. */
+  private _abortRobotTask(r: Robot) {
+    if (r.taskId) {
+      const t = this.task(r.taskId);
+      if (t) {
+        t.status = "pending";
+        t.robotId = null;
+      }
+    }
+    r.taskId = null;
+    r.packageId = null;
+    r.status = "returning";
+    r.stuckTicks = 0;
+    this.log("replan", `${r.id} aborted task due to deadlock — returning home`, r.id);
+    this.plan(r, r.home);
   }
 
   private addConflict(kind: Conflict["kind"], robots: string[], cell: Cell) {
@@ -881,7 +948,6 @@ export class Engine {
     for (const c of this.conflicts) if (!c.resolved && c.robots[0] === id) c.resolved = true;
   }
 
-  /** Syncs upcoming reservations from the Space-Time Reservation Table for UI rendering. */
   computeReservations() {
     this.reservations = this.reservationTable.getAllUpcoming(this.tick, 8);
   }
